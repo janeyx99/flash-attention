@@ -10,7 +10,7 @@
 inline bool use_one_mma_wg(Flash_fwd_params const& params) {
     // Use 1 MMA warp group instead of 2-3 when effective Q length is small.
     // This gives better perf for decode / small-batch scenarios on Hopper.
-    return params.arch >= 90 && (params.d == 128 || params.d == 64) && !params.is_local &&
+    return params.arch >= 90 && (params.d == 128 || params.d == 64) &&
         params.seqlen_q * (params.h / params.h_k) <= 64;
 };
 
