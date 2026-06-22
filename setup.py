@@ -68,6 +68,9 @@ ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
 if IS_ROCM:
     ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
+# Route host C++ and nvcc compilation through ccache when it's installed. Opt out
+# with FLASH_ATTENTION_DISABLE_CCACHE=TRUE.
+DISABLE_CCACHE = os.getenv("FLASH_ATTENTION_DISABLE_CCACHE", "FALSE") == "TRUE"
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
@@ -616,8 +619,62 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 
+def maybe_setup_ccache() -> None:
+    """Transparently route compilation through ccache when it is available.
+
+    FA2 builds via setuptools -> torch BuildExtension -> ninja (not CMake), so the
+    CMake-style ``CMAKE_CUDA_COMPILER_LAUNCHER`` knob that sgl-kernel/vLLM use does
+    not apply. The ninja equivalents are env vars that torch's ninja writer reads:
+    ``$CXX`` for host C++ sources and ``$PYTORCH_NVCC`` for nvcc (torch added the
+    latter specifically so nvcc can be wrapped with ccache). We prepend ccache to
+    both.
+
+    nvcc is only cacheable once torch's ``--generate-dependencies-with-compile``
+    flag is dropped -- with it, ccache reports every call as "uncacheable". We drop
+    it via ``TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES=1``. ccache still detects
+    header changes on its own, so the cache stays correct; the only tradeoff is that
+    ninja no longer tracks .cu header deps for incremental rebuilds (irrelevant for
+    clean/CI builds, which is where ccache pays off most).
+    """
+    if DISABLE_CCACHE:
+        return
+    ccache = shutil.which("ccache")
+    if ccache is None:
+        return
+
+    # Host C++ compiler (flash_api.cpp, etc.); respect an existing $CXX.
+    cxx = os.environ.get("CXX", "c++")
+    if "ccache" not in cxx:
+        os.environ["CXX"] = f"{ccache} {cxx}"
+
+    # CUDA compiler. Only override nvcc for CUDA builds; ROCm uses hipcc.
+    if not IS_ROCM:
+        nvcc = os.path.join(CUDA_HOME, "bin", "nvcc") if CUDA_HOME else shutil.which("nvcc")
+        if nvcc and "PYTORCH_NVCC" not in os.environ:
+            os.environ["PYTORCH_NVCC"] = f"{ccache} {nvcc}"
+        # Required for nvcc calls to be cacheable (see docstring).
+        os.environ.setdefault("TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES", "1")
+
+    # Make the cache relocatable. Each `pip install .` builds in a fresh /tmp/pip-*/
+    # dir, and FA2's include dirs are absolute (see the abs-path note near
+    # `this_dir`), so without this the absolute -I/source paths under the temp dir
+    # change every build and defeat the cache. CCACHE_BASEDIR rewrites paths under it
+    # to relative before hashing; NOHASHDIR drops the cwd from the hash.
+    os.environ.setdefault("CCACHE_BASEDIR", this_dir)
+    os.environ.setdefault("CCACHE_NOHASHDIR", "1")
+    # Keep direct-mode hits when a fresh checkout/temp copy has new file timestamps
+    # but identical content (optional; relaxes ccache's header stat checks).
+    os.environ.setdefault("CCACHE_SLOPPINESS", "include_file_ctime,include_file_mtime,time_macros")
+
+    print(
+        f"Using ccache ({ccache}) to cache compilation. "
+        "Set FLASH_ATTENTION_DISABLE_CCACHE=TRUE to disable."
+    )
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
+        maybe_setup_ccache()
         # do not override env MAX_JOBS if already exists
         if not os.environ.get("MAX_JOBS"):
             import psutil
