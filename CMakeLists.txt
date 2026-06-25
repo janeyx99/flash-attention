@@ -173,6 +173,11 @@ if (FA2_ENABLED)
         # FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
+        # Stable-ABI build: USE_CUDA exposes aoti_torch_get_current_cuda_stream in
+        # shim.h; TORCH_TARGET_VERSION pins the runtime floor (2.10) and bans
+        # unstable libtorch headers. 0x020A... = (2<<56)|(10<<48).
+        USE_CUDA
+        TORCH_TARGET_VERSION=0x020A000000000000ULL
     )
 endif ()
 
